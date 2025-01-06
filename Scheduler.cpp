@@ -11,35 +11,6 @@ pseudocode discussed in class with additional modifications and considerations.
 Based on an estimation of utilization and load factor as a task-servicing policy
 and the consolidation of tasks on as few machines as possible to save energy while
 still meeting SLA requirements.
-
-The pseudocode is as follows:
-
-Initialization and new requests:
-Given m physical machines and n workloads
-for each i in n
-for each j in m
-Let u be the current utilization of machine j
-Let v be the load factor of job i
-If u + v < 1
-Place workload i in a VM on machine j
-i = i + 1
-end
-If there are unallocated workloads: SLA violation
-If there are machines with u = 0, turn them off
-
-Workload Completion:
-Assume workload i finishes on machine j
-Sort all j in m in a set s in ascending order of u
-For all j in s where u > 0
-For all workloads i on j
-For all k > j
-Let u be the current utilization of machine j
-Let v be the load factor of job i
-If u + v < 1
-Migrate workload i in a VM on machine k
-i = i + 1
-If no more VM’s are on machine j then turn it off and continue, else, exit
-End
 */
 
 //basic header import
@@ -54,7 +25,7 @@ typedef enum {
     TASK_READY,
     NOW_IDLE
 } WakeupProtocol_t;
-#define WAKEUP_STATES 4
+#define WAKEUP_STATES 2
 
 //struct to provide information to machines after a state change    
 struct wakeup_information {
@@ -68,6 +39,11 @@ static vector<MachineId_t> active_machines;
 static vector<MachineId_t> idle_machines;
 //number of machines actively servicing tasks
 int machines_in_use = 0;
+//minimum machines active
+int min_machines = 0;
+
+//tasks that have not been serviced yet
+static vector<TaskId_t> hanging_tasks;
 
 //mapping of machines to vectors containing vms on those machines
 unordered_map<MachineId_t, vector<VMId_t>> vm_map;
@@ -79,17 +55,22 @@ unordered_map<TaskId_t, VMId_t> task_vm_map;
 unordered_map<MachineId_t, wakeup_information> wakeup_instructions;
 
 //Constants used for algorithmic decisions/heuristics
+//Minimum percentage of machines that the algorithm cannot shutdown beyond.
+double MIN_MACHINE_PERCENTAGE = 0.2;
+//Constant used in modulo to determine the proportion of machines with u = 0 shutdown
+int MACHINE_SHUTDOWN_FACTOR = 5;
 //Percentage of memory the CPU will keep free to protect performance.
 double CPU_MEMORY_SLACK = 0.1;
 //Describes the power state considered "idle" or "inactive"
-MachineState_t IDLE_STATE = S3;
+MachineState_t IDLE_STATE = S1;
 
 
 //Returns how many million instructions per second the CPU on the machine is capable of issuing.
 unsigned current_mips_rating(MachineId_t machine_id) {
+    //SimOutput("current mips getinfo", 1);
     MachineInfo_t machine_info = Machine_GetInfo(machine_id);
     CPUPerformance_t current_p_state = machine_info.p_state;
-    return machine_info.performance[current_p_state];
+    return machine_info.performance[current_p_state] * machine_info.num_cpus;
 }  
 
 //assign initial priority to a task based on its SLA requirements
@@ -114,7 +95,8 @@ double task_load_factor(TaskId_t task, MachineId_t machine_id) {
         return 0.0; //Task will be starved, can disregard CPU load
     }
     TaskInfo_t task_info = GetTaskInfo(task);
-    double instructions_per_ms = task_info.remaining_instructions / (task_info.target_completion - Now());
+    double instructions_per_ms = (double) task_info.remaining_instructions / (double) (task_info.target_completion - Now());
+    //SimOutput("TaskLoadFactor: val is " + to_string(instructions_per_ms / current_mips_rating(machine_id)), 1);
     return instructions_per_ms / current_mips_rating(machine_id);
 }
 
@@ -137,7 +119,7 @@ double vm_utilization(VMId_t vm_id) {
 //Approximate the current utilization of the given machine.
 double machine_utilization(MachineId_t machine_id) {
     double utilization_total = 0;
-    vector<VMId_t> machine_vms = vm_map[machine_id];
+    vector<VMId_t> &machine_vms = vm_map[machine_id];
     for(auto vm : machine_vms) {
         utilization_total += vm_utilization(vm);
     }
@@ -151,6 +133,7 @@ bool task_compatible(TaskId_t task, MachineId_t machine_id) {
 
 //Determines whether the machine can handle the load factor of the task.
 bool can_handle_load(MachineId_t machine_id, TaskId_t task) {
+    //SimOutput("can handle load getinfo", 1);
     MachineInfo_t machine_info = Machine_GetInfo(machine_id);
     int total_memory = machine_info.memory_size;
     //keep a certain amount of memory free to protect performance
@@ -172,18 +155,20 @@ bool task_fits_machine(TaskId_t task, MachineId_t machine_id) {
 
 //Used to sort VMs on a machine in descending order of utilization.
 bool vm_u_comparator(VMId_t i, VMId_t j) {
-    return vm_utilization(i) > vm_utilization(j);
+    return vm_utilization(i) < vm_utilization(j);
 }
 
 //Used to sort VMs on a machine in descending order of utilization.
 bool machine_u_comparator(MachineId_t i, MachineId_t j) {
-    return machine_utilization(i) > machine_utilization(j);
+    return machine_utilization(i) < machine_utilization(j);
 }
 
 //Prioritizes whether a machine has a GPU over utilization for cases where a task
 //is GPU capable.
 bool machine_gpu_comparator(MachineId_t i, MachineId_t j) {
+    //SimOutput("comparator getinfo 1", 1);
     MachineInfo_t i_info = Machine_GetInfo(i);
+    //SimOutput("comparator getinfo 2", 1);
     MachineInfo_t j_info = Machine_GetInfo(j);
     //if machine i is gpu capable and machine j is not, prioritize i always
     return (i_info.gpus && !j_info.gpus) || machine_u_comparator(i, j);
@@ -215,6 +200,7 @@ int vm_mem_load(VMId_t vm_id) {
 }
 
 bool migration_feasible(VMId_t vm_id, MachineId_t machine_id) {
+    //SimOutput("migration getinfo 1", 1);
     MachineInfo_t machine_info = Machine_GetInfo(machine_id);
     int total_memory = machine_info.memory_size;
     //keep a certain amount of memory free to protect performance
@@ -232,29 +218,53 @@ bool migration_feasible(VMId_t vm_id, MachineId_t machine_id) {
 void Scheduler::Init() {
     SimOutput("Scheduler::Init(): Total number of machines is " + to_string(Machine_GetTotal()), 3);
     SimOutput("Scheduler::Init(): Initializing scheduler", 1);
-    int num_machines = Machine_GetTotal();
+    active_machines = {};
+    idle_machines = {};
+    machines_in_use = Machine_GetTotal();
+    min_machines = (Machine_GetTotal() * MIN_MACHINE_PERCENTAGE) + 1; //+1 to prevent floor of 0
     //add machines to log of machines and online machines
-    for(int i = 0; i < num_machines; i++) {
+    for(int i = 0; i < machines_in_use; i++) {
         machines.push_back(MachineId_t(i));
+        vm_map[MachineId_t(i)] = {};
         //machines are online by default 
         active_machines.push_back(MachineId_t(i));
     }
-    SimOutput("Scheduler::Init(): VM ids are " + to_string(vms[0]) + " ahd " + to_string(vms[1]), 3);
+    SimOutput("Scheduler::Init(): Size of active list is " + to_string(active_machines.size()), 1);
 }
 
 void Scheduler::MigrationComplete(Time_t time, VMId_t vm_id) {
-    // Update your data structure. The VM now can receive new tasks
+    VMInfo_t vm_info = VM_GetInfo(vm_id);
+    MachineId_t machine = vm_info.machine_id;
+    //allow machine to be discovered again
+    active_machines.push_back(machine);
+    //add the new vm to the list on the machines
+    vm_map[machine].push_back(vm_id);
+}
+
+bool machine_inactive(MachineId_t machine_id) {
+    vector<VMId_t> &machine_vms = vm_map[machine_id];
+    for(auto vm : machine_vms) {
+        if(VM_GetInfo(vm).active_tasks.size() != 0) {
+            return false;
+        }
+    }
+    return true;
 }
 
 //Finds machines with zero utilization (inactive) and turns them off.
 void handle_inactive_machines() {
+    //SimOutput("handle_inactive_machines: Entering function with active machines: " + to_string(machines_in_use), 1);
     //Search for inactive machines
+    int count = 0;
     for(auto iter = active_machines.begin(); iter != active_machines.end();) {
         MachineId_t cur_machine = *iter;
-        if(machine_utilization(cur_machine) == 0.0) {
-            vector<VMId_t> machine_vms = vm_map[cur_machine];
+        //SimOutput("handle_inactive_machines: Util/Count " + to_string(machine_utilization(cur_machine)) + " " + to_string(count), 1);
+        if(machine_inactive(cur_machine) && count % MACHINE_SHUTDOWN_FACTOR == 1 && machines_in_use > min_machines) {
+            vector<VMId_t> &machine_vms = vm_map[cur_machine];
             for(auto vm : machine_vms) {
-                VM_Shutdown(vm);
+                if(VM_GetInfo(vm).active_tasks.size() == 0) {
+                    VM_Shutdown(vm);
+                }
             }
             machine_vms.clear(); //finish cleaning VMs
             //erase machine from the list
@@ -263,10 +273,15 @@ void handle_inactive_machines() {
             task_payload.instruction = NOW_IDLE;
             //machine has instructions to add itself to idle list upon wakeup
             wakeup_instructions[cur_machine] = task_payload;
+            machines_in_use--;
             Machine_SetState(cur_machine, IDLE_STATE);
+        } else {
+            //only increment when nothing has been erased
+            ++iter;
         }
-        ++iter;
+        count++;
     }
+    //SimOutput("handle_inactive_machines: Exiting function with active machines: " + to_string(machines_in_use), 1);
 }
 
 void Scheduler::NewTask(Time_t now, TaskId_t task_id) {
@@ -277,22 +292,28 @@ void Scheduler::NewTask(Time_t now, TaskId_t task_id) {
     } else {
         sort(active_machines.begin(), active_machines.end(), machine_u_comparator);
     }
+    // SimOutput(" NewTask: Machine utilization at begin: " + to_string(machine_utilization((*active_machines.begin()))), 1);
+    // SimOutput(" NewTask: Machine utilization at end: " + to_string(machine_utilization((*active_machines.end()))), 1);
+    SimOutput(" NewTask: Enter Active loop.", 3);
     for(MachineId_t cur_machine : active_machines) {
         //checks if task "fits" the machine (type, u + v load calculation)
         if(task_fits_machine(task_id, cur_machine)) {
-            vector<VMId_t> machine_vms = vm_map[cur_machine];
+            vector<VMId_t> &machine_vms = vm_map[cur_machine];
+            bool found = false;
             VMId_t selected_vm;
             //sort vms in descending order of utilization
             sort(machine_vms.begin(), machine_vms.end(), vm_u_comparator);
             //iterate and select the first VM compatible with the task
             for(VMId_t cur_vm : machine_vms) {
-                if(VM_GetInfo(cur_vm).vm_type == RequiredVMType(task_id)) {
+                VMInfo_t vm_info = VM_GetInfo(cur_vm);
+                if(vm_info.vm_type == RequiredVMType(task_id) && vm_info.cpu == RequiredCPUType(task_id)) {
                     selected_vm = cur_vm;
+                    found = true;
                     break; //compatible vm found
                 }
             }
             //if no compatible VM was found, make one and attach it
-            if(selected_vm == NULL) {
+            if(!found) {
                 VMId_t task_vm = VM_Create(RequiredVMType(task_id), RequiredCPUType(task_id));
                 VM_Attach(task_vm, cur_machine);
                 machine_vms.push_back(task_vm);
@@ -301,15 +322,16 @@ void Scheduler::NewTask(Time_t now, TaskId_t task_id) {
             //add the task to the selected machine
             VM_AddTask(selected_vm, task_id, assign_priority(task_id));
             task_vm_map[task_id] = selected_vm;
-            handle_inactive_machines();
+            SimOutput(" NewTask: Active loop success! Exit.", 3);
             return;
         }
     }
 
     //Machine/VM pair not found; find new machine
     //Iterate over idle machines and find match
-    for(int i = 0; i < idle_machines.size(); i++) {
-        MachineId_t cur_machine = idle_machines[i];
+    SimOutput(" NewTask: Enter idle loop after Active loop fails to find.", 3);
+    for(auto iter = idle_machines.begin(); iter != idle_machines.end();) {
+        MachineId_t cur_machine = *iter;
         if(task_compatible(task_id, cur_machine)) {
             //give the machine information to add task when it wakes up
             wakeup_information task_payload;
@@ -320,9 +342,11 @@ void Scheduler::NewTask(Time_t now, TaskId_t task_id) {
             //turn on machine to a ready state
             Machine_SetState(cur_machine, S0);
             //remove machine from idle vector, on wakeup it will add itself to active
-            idle_machines.erase(idle_machines.begin() + i);
-            handle_inactive_machines();
+            iter = idle_machines.erase(iter);
+            SimOutput(" NewTask: Idle loop success! Exit.", 3);
             return;
+        } else {
+            ++iter;
         }
     }
 
@@ -330,6 +354,7 @@ void Scheduler::NewTask(Time_t now, TaskId_t task_id) {
     //Create a new VM for it so it can be migrated more easily in the future
     //Attach it to machine with the smallest load possible
     VMId_t task_vm = VM_Create(RequiredVMType(task_id), RequiredCPUType(task_id));
+    SimOutput(" NewTask: Enter fallback loop after idle loop fails to find.", 3);
     for(int i = active_machines.size() - 1; i >= 0; i--) {
         MachineId_t cur_machine = active_machines[i];
         if(task_compatible(task_id, cur_machine)) {
@@ -337,20 +362,23 @@ void Scheduler::NewTask(Time_t now, TaskId_t task_id) {
             VM_AddTask(task_vm, task_id, HIGH_PRIORITY);
             vm_map[cur_machine].push_back(task_vm);
             task_vm_map[task_id] = task_vm;
+            SimOutput(" NewTask: Fallback loop success! Exit.", 3);
+            return;
         }
     }
 
-    handle_inactive_machines();
 
-    //If we get here, something has gone terribly wrong.
-    //Only should be possible if a capable machine does not exist
+    SimOutput(" NewTask: All loops have exited. No machines available", 3);
+    //If we get there even with all precautions, we bite the bullet and let 
+    //PeriodicCheck service new tasks later.
+    hanging_tasks.push_back(task_id);
 }
 
 void Scheduler::TaskComplete(Time_t now, TaskId_t task_id) {
     // Do any bookkeeping necessary for the data structures
     // Decide if a machine is to be turned off, slowed down, or VMs to be migrated according to your policy
     // This is an opportunity to make any adjustments to optimize performance/energy
-
+    handle_inactive_machines();
     /*
     VMId_t task_vm = task_vm_map[task_id];
     MachineId_t task_machine = VM_GetInfo(task_vm).machine_id;  
@@ -395,7 +423,7 @@ void Scheduler::PeriodicCheck(Time_t now) {
     // Unlike the other invocations of the scheduler, this one doesn't report any specific event
     // Recommendation: Take advantage of this function to do some monitoring and adjustments as necessary
 
-    //Monitoring happens routinely at other event calls elsewhere
+    //Rescue hanging tasks!
 }
 
 void Scheduler::Shutdown(Time_t time) {
@@ -477,13 +505,13 @@ void SLAWarning(Time_t time, TaskId_t task_id) {
         if(cur_machine != VM_GetInfo(task_vm).machine_id) {
             if(migration_feasible(task_vm, cur_machine)) {
                 //migrate workload i to machine k
-                vector<VMId_t> task_machine_vmlist = vm_map[task_machine];
+                vector<VMId_t> &task_machine_vmlist = vm_map[task_machine];
                 //first find vm in list to remove it 
                 for(int i = 0; i < task_machine_vmlist.size(); i++) {
                     if(task_machine_vmlist[i] == task_vm) {
                         task_machine_vmlist.erase(task_machine_vmlist.begin() + i);
                         //do not consider machine being migrated to until migration is done
-                        acstive_machines.erase(iter); 
+                        active_machines.erase(iter); 
                         VM_Migrate(task_vm, cur_machine);
                         //migration done, now we pray!
                         return;
@@ -497,10 +525,11 @@ void SLAWarning(Time_t time, TaskId_t task_id) {
 }
 
 void StateChangeComplete(Time_t time, MachineId_t machine_id) {
+    SimOutput("StateChangeComplete: Enter function.", 3);
     wakeup_information wakeup_info = wakeup_instructions[machine_id];
     // Called in response to an earlier request to change the state of a machine
     switch(wakeup_info.instruction) {
-        case TASK_READY: //this machine was turned on in NewTask to service a task
+        case TASK_READY:{ //this machine was turned on in NewTask to service a task
             TaskId_t task = wakeup_info.task;
             //create new vm and attach it to machine with task
             VMId_t task_vm = VM_Create(RequiredVMType(task), RequiredCPUType(task));
@@ -510,13 +539,18 @@ void StateChangeComplete(Time_t time, MachineId_t machine_id) {
             task_vm_map[task] = task_vm;
             //machine is now ready to be discoverable by algorithm
             active_machines.push_back(machine_id);
+            machines_in_use++;
             break;
-        case NOW_IDLE:
+        }
+        case NOW_IDLE: {
             //state change is done, make it visible to algorithm again
             idle_machines.push_back(machine_id);
             break;
-        default:
+        }
+        default: {
             break;
+        }
     }
+    SimOutput("StateChangeComplete: Exit function.", 3);
 }
 
