@@ -62,7 +62,7 @@ int MACHINE_SHUTDOWN_FACTOR = 5;
 //Percentage of memory the CPU will keep free to protect performance.
 double CPU_MEMORY_SLACK = 0.1;
 //Describes the power state considered "idle" or "inactive"
-MachineState_t IDLE_STATE = S1;
+MachineState_t IDLE_STATE = S5;
 
 
 //Returns how many million instructions per second the CPU on the machine is capable of issuing.
